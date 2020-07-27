@@ -46,6 +46,8 @@
 using namespace mvsim;
 
 #if defined(MVSIM_HAS_ZMQ)
+namespace mvsim::internal
+{
 struct InfoPerAdvertisedTopic
 {
 	InfoPerAdvertisedTopic(zmq::context_t& c) : context(c) {}
@@ -67,6 +69,28 @@ struct InfoPerService
 	const google::protobuf::Descriptor* descOutput = nullptr;
 	Client::service_callback_t callback;
 };
+struct InfoPerSubscribedTopic
+{
+	InfoPerSubscribedTopic(zmq::context_t& c) : context(c)
+	{
+		MRPT_TODO("Launch thread!");
+	}
+	~InfoPerSubscribedTopic()
+	{
+		if (topicThread.joinable()) topicThread.join();
+	}
+
+	zmq::context_t& context;
+
+	std::string topicName;
+	zmq::socket_t subSocket = zmq::socket_t(context, ZMQ_SUB);
+	const google::protobuf::Descriptor* descriptor = nullptr;
+
+	std::vector<Client::topic_callback_t> callbacks;
+
+	std::thread topicThread;
+};
+}  // namespace mvsim::internal
 #endif
 
 struct Client::ZMQImpl
@@ -76,12 +100,16 @@ struct Client::ZMQImpl
 	std::optional<zmq::socket_t> mainReqSocket;
 	mvsim::SocketMonitor mainReqSocketMonitor;
 
-	std::map<std::string, InfoPerAdvertisedTopic> advertisedTopics;
+	std::map<std::string, internal::InfoPerAdvertisedTopic> advertisedTopics;
 	std::shared_mutex advertisedTopics_mtx;
 
 	std::optional<zmq::socket_t> srvListenSocket;
-	std::map<std::string, InfoPerService> offeredServices;
+	std::map<std::string, internal::InfoPerService> offeredServices;
 	std::shared_mutex offeredServices_mtx;
+
+	std::map<std::string, internal::InfoPerSubscribedTopic> subscribedTopics;
+	std::shared_mutex subscribedTopics_mtx;
+
 #endif
 };
 
@@ -318,7 +346,7 @@ void Client::doAdvertiseTopic(
 
 	// the ctor of InfoPerAdvertisedTopic automatically creates a ZMQ_PUB
 	// socket in pubSocket
-	InfoPerAdvertisedTopic& ipat =
+	internal::InfoPerAdvertisedTopic& ipat =
 		advTopics.emplace_hint(advTopics.begin(), topicName, zmq_->context)
 			->second;
 
@@ -384,7 +412,7 @@ void Client::doAdvertiseService(
 			"Service `%s` already registered in this same client!",
 			serviceName.c_str());
 
-	InfoPerService& ips = services[serviceName];
+	internal::InfoPerService& ips = services[serviceName];
 
 	lck.unlock();
 
@@ -455,8 +483,7 @@ void Client::publishTopic(
 	ASSERTMSG_(
 		msg.GetDescriptor() == ipat.descriptor,
 		mrpt::format(
-			"Topic `%s` has type `%s`, but expected `%s` from former call "
-			"to "
+			"Topic `%s` has type `%s`, but expected `%s` from former call to "
 			"advertiseTopic()?",
 			topicName.c_str(), msg.GetDescriptor()->name().c_str(),
 			ipat.descriptor->name().c_str()));
@@ -515,7 +542,7 @@ void Client::internalServiceServingThread()
 				continue;
 			}
 
-			InfoPerService& ips = itSrv->second;
+			internal::InfoPerService& ips = itSrv->second;
 
 			// MRPT_TODO("Check input descriptor?");
 
@@ -593,6 +620,32 @@ void Client::doCallService(
 
 	const auto m = mvsim::receiveMessage(srvReqSock);
 	mvsim::parseMessage(m, output);
+#endif
+	MRPT_END
+}
+
+void Client::doSubscribeTopic(
+	const std::string& topicName,
+	const google::protobuf::Descriptor* descriptor,
+	const topic_callback_t& callback)
+{
+	MRPT_START
+#if defined(MVSIM_HAS_ZMQ) && defined(MVSIM_HAS_PROTOBUF)
+	// Register in my internal DB:
+	std::unique_lock<std::shared_mutex> lck(zmq_->subscribedTopics_mtx);
+
+	auto& topics = zmq_->subscribedTopics;
+
+	// It's ok to subscribe more than once:
+	internal::InfoPerSubscribedTopic& ipt = topics[topicName];
+
+	lck.unlock();
+
+	// Let the server know about our interest in the topic:
+
+	// That is... the rest will be done upon reception of messages from the
+	// server on potential clients we should subscribe to.
+
 #endif
 	MRPT_END
 }
